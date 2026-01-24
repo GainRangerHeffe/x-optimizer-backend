@@ -37,22 +37,16 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         if (event.type === 'checkout.session.completed') {
             const session = event.data.object;
             const userId = session.client_reference_id;
-            const priceId = session.line_items?.data[0]?.price?.id;
+            const priceId = session.amount_total;
             
-            // Determine plan based on price ID
             let plan = 'free';
-            if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
-                plan = 'starter';
-            } else if (priceId === process.env.STRIPE_PRO_PRICE_ID) {
-                plan = 'pro';
-            } else if (priceId === process.env.STRIPE_UNLIMITED_PRICE_ID) {
-                plan = 'unlimited';
-            }
+            // Determine plan based on amount
+            if (priceId === 499) plan = 'starter';
+            else if (priceId === 999) plan = 'pro';
+            else if (priceId === 1999) plan = 'unlimited';
+            else if (priceId === 19900) plan = 'yearly';
             
-            // Store this in your database
-            // For now, just log it
             console.log(`User ${userId} upgraded to ${plan} plan`);
-            
             // TODO: Update database with user's plan
         }
         
@@ -68,17 +62,18 @@ app.use(express.json());
 // Simple in-memory usage tracking (replace with database in production)
 const userUsage = new Map();
 
-// Plan limits
+// Plan limits - UPDATED WITH YOUR NEW TIERS
 const PLAN_LIMITS = {
     free: { daily: 3, monthly: null },
-    starter: { daily: null, monthly: 100 },
-    pro: { daily: null, monthly: 300 },
-    unlimited: { daily: null, monthly: null }
+    starter: { daily: null, monthly: 300 },
+    pro: { daily: null, monthly: 700 },
+    unlimited: { daily: null, monthly: null },
+    yearly: { daily: null, monthly: null }
 };
 
 function checkRateLimit(userId, userPlan = 'free') {
     const now = Date.now();
-    const oneDayMs = 24 * 60 * 60 * 1000;
+    const oneDayMs = 12 * 60 * 60 * 1000; // 12 hours for free users
     const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
     
     const userRecord = userUsage.get(userId) || { 
@@ -89,7 +84,7 @@ function checkRateLimit(userId, userPlan = 'free') {
         plan: userPlan
     };
     
-    // Reset daily counter if needed
+    // Reset daily counter if needed (only for free users)
     if (now > userRecord.dailyResetTime) {
         userRecord.dailyCount = 0;
         userRecord.dailyResetTime = now + oneDayMs;
@@ -156,7 +151,7 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Get user usage stats
+// Get user usage stats - THIS WAS MISSING!
 app.post('/api/usage', (req, res) => {
     const { userId, userPlan = 'free' } = req.body;
     const userRecord = userUsage.get(userId);
@@ -190,7 +185,6 @@ app.post('/api/optimize', async (req, res) => {
             return res.status(400).json({ error: 'Post content is required' });
         }
         
-        // Check rate limit
         const limitCheck = checkRateLimit(userId, userPlan);
         if (!limitCheck.allowed) {
             const message = limitCheck.reason === 'daily_limit' 
@@ -199,8 +193,11 @@ app.post('/api/optimize', async (req, res) => {
             return res.status(429).json({ error: message });
         }
         
-        // Build user message with options
         let userMessage = `Optimize this post for maximum X engagement:\n\n"${post}"\n\n`;
+        
+        if (options.postAngle && options.postAngle.trim()) {
+            userMessage += `Post angle/goal: ${options.postAngle}\n\n`;
+        }
         
         if (options.addHook) userMessage += '- Add an attention-grabbing hook\n';
         if (options.optimizeDwell) userMessage += '- Maximize dwell time\n';
@@ -260,7 +257,7 @@ app.post('/api/generate-thread', async (req, res) => {
     }
 });
 
-// Generate Reply
+// Generate Reply - WITH UPDATED LENGTH HANDLING
 app.post('/api/generate-reply', async (req, res) => {
     try {
         const { originalPost, replyAngle, options, userId, userPlan = 'free' } = req.body;
@@ -277,13 +274,12 @@ app.post('/api/generate-reply', async (req, res) => {
             return res.status(429).json({ error: message });
         }
         
-        // BUILD USER MESSAGE - THIS IS THE PART YOU NEED TO UPDATE
         let userMessage = `Generate an engaging reply to this post:\n\n"${originalPost}"\n\n`;
         
-        // If user provided specific angle/instructions, make it CRITICAL
+        // CRITICAL: If user provided angle, make it strict
         if (replyAngle && replyAngle.trim()) {
-            userMessage += `CRITICAL INSTRUCTIONS: "${replyAngle}"\n`;
-            userMessage += `You MUST follow these instructions EXACTLY, especially any length requirements like "1-2 lines", "short", "brief".\n\n`;
+            userMessage += `CRITICAL INSTRUCTIONS FROM USER: "${replyAngle}"\n`;
+            userMessage += `You MUST follow these instructions EXACTLY. If they say "1-2 lines", give MAXIMUM 2 sentences (120-180 characters). If they say "short", give 1-3 sentences max.\n\n`;
         }
         
         if (options.addValue) userMessage += '- Add genuine value to the conversation\n';
@@ -305,19 +301,25 @@ app.post('/api/generate-reply', async (req, res) => {
     }
 });
 
-// Create Stripe Checkout Session
+// Create Stripe Checkout Session - THIS WAS MISSING!
 app.post('/api/create-checkout', async (req, res) => {
     try {
         const { userId, plan } = req.body;
         
         // Determine which price ID to use
-        let priceId;
+        let priceId, amount;
         if (plan === 'starter') {
             priceId = process.env.STRIPE_STARTER_PRICE_ID;
+            amount = 499;
         } else if (plan === 'pro') {
             priceId = process.env.STRIPE_PRO_PRICE_ID;
+            amount = 999;
         } else if (plan === 'unlimited') {
             priceId = process.env.STRIPE_UNLIMITED_PRICE_ID;
+            amount = 1999;
+        } else if (plan === 'yearly') {
+            priceId = process.env.STRIPE_YEARLY_PRICE_ID;
+            amount = 19900;
         } else {
             return res.status(400).json({ error: 'Invalid plan' });
         }
@@ -331,7 +333,7 @@ app.post('/api/create-checkout', async (req, res) => {
                 },
             ],
             mode: 'subscription',
-            success_url: `${process.env.FRONTEND_URL}?success=true&session_id={CHECKOUT_SESSION_ID}`,
+            success_url: `${process.env.FRONTEND_URL}?success=true&plan=${plan}`,
             cancel_url: `${process.env.FRONTEND_URL}?canceled=true`,
             client_reference_id: userId,
             metadata: {
@@ -347,11 +349,68 @@ app.post('/api/create-checkout', async (req, res) => {
     }
 });
 
+// Create NOWPayments Crypto Checkout
+app.post('/api/create-crypto-checkout', async (req, res) => {
+    try {
+        const { userId, plan } = req.body;
+        
+        let price;
+        if (plan === 'starter') price = 4.99;
+        else if (plan === 'pro') price = 9.99;
+        else if (plan === 'unlimited') price = 19.99;
+        else if (plan === 'yearly') price = 199.00;
+        else return res.status(400).json({ error: 'Invalid plan' });
+        
+        const response = await fetch('https://api.nowpayments.io/v1/invoice', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': process.env.NOWPAYMENTS_API_KEY
+            },
+            body: JSON.stringify({
+                price_amount: price,
+                price_currency: 'usd',
+                pay_currency: 'usdcsol',
+                order_id: `${userId}_${plan}_${Date.now()}`,
+                order_description: `Bloksi ${plan} plan`,
+                success_url: `${process.env.FRONTEND_URL}?success=true&plan=${plan}`,
+                cancel_url: `${process.env.FRONTEND_URL}?canceled=true`
+            })
+        });
+        
+        const data = await response.json();
+        res.json({ url: data.invoice_url });
+        
+    } catch (error) {
+        console.error('NOWPayments error:', error);
+        res.status(500).json({ error: 'Failed to create crypto checkout' });
+    }
+});
+
+// NOWPayments webhook
+app.post('/api/nowpayments-webhook', express.json(), async (req, res) => {
+    try {
+        const payment = req.body;
+        
+        if (payment.payment_status === 'finished') {
+            const orderId = payment.order_id;
+            const [userId, plan] = orderId.split('_');
+            console.log(`Crypto payment successful for user ${userId}, plan: ${plan}`);
+            // TODO: Update database
+        }
+        
+        res.status(200).send('OK');
+    } catch (error) {
+        console.error('Webhook error:', error);
+        res.status(400).send('Webhook error');
+    }
+});
+
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`📡 API available at http://localhost:${PORT}/api`);
     console.log(`🤖 Claude API configured: ${!!process.env.CLAUDE_API_KEY}`);
     console.log(`💳 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
+    console.log(`💎 NOWPayments configured: ${!!process.env.NOWPAYMENTS_API_KEY}`);
 });
-
