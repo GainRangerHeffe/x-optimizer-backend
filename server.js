@@ -414,3 +414,40 @@ app.listen(PORT, () => {
     console.log(`💳 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
     console.log(`💎 NOWPayments configured: ${!!process.env.NOWPAYMENTS_API_KEY}`);
 });
+
+// Handle Mid-Month Upgrade
+app.post('/api/upgrade-plan', async (req, res) => {
+    try {
+        const { userId, currentPlan, newPlan } = req.body;
+        
+        // Validate upgrade path
+        const validUpgrades = {
+            'free': ['starter', 'pro', 'unlimited', 'yearly'],
+            'starter': ['pro', 'unlimited', 'yearly'],
+            'pro': ['unlimited', 'yearly']
+        };
+        
+        if (!validUpgrades[currentPlan]?.includes(newPlan)) {
+            return res.status(400).json({ error: 'Invalid upgrade path' });
+        }
+        
+        // Reset usage limits immediately for new plan
+        const userRecord = userUsage.get(userId);
+        if (userRecord) {
+            userRecord.monthlyCount = 0; // Reset count for new tier
+            userRecord.plan = newPlan;
+            userUsage.set(userId, userRecord);
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Plan upgraded successfully',
+            newPlan: newPlan
+        });
+        
+    } catch (error) {
+        console.error('Upgrade error:', error);
+        res.status(500).json({ error: 'Failed to upgrade plan' });
+    }
+});
+
