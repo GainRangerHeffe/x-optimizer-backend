@@ -277,10 +277,13 @@ app.post('/api/generate-reply', async (req, res) => {
             return res.status(429).json({ error: message });
         }
         
+        // BUILD USER MESSAGE - THIS IS THE PART YOU NEED TO UPDATE
         let userMessage = `Generate an engaging reply to this post:\n\n"${originalPost}"\n\n`;
         
+        // If user provided specific angle/instructions, make it CRITICAL
         if (replyAngle && replyAngle.trim()) {
-            userMessage += `My perspective/angle: ${replyAngle}\n\n`;
+            userMessage += `CRITICAL INSTRUCTIONS: "${replyAngle}"\n`;
+            userMessage += `You MUST follow these instructions EXACTLY, especially any length requirements like "1-2 lines", "short", "brief".\n\n`;
         }
         
         if (options.addValue) userMessage += '- Add genuine value to the conversation\n';
@@ -351,3 +354,4 @@ app.listen(PORT, () => {
     console.log(`🤖 Claude API configured: ${!!process.env.CLAUDE_API_KEY}`);
     console.log(`💳 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
 });
+
