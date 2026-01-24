@@ -1,7 +1,7 @@
 {
   "name": "x-optimizer-backend",
   "version": "1.0.0",
-  "description": "Backend API for X Optimizer Pro",
+  "description": "Backend API for X Optimizer Pro with tiered pricing",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "@anthropic-ai/sdk": "^0.24.0"
+    "@anthropic-ai/sdk": "^0.24.0",
+    "stripe": "^14.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
