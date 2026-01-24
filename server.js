@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 require('dotenv').config();
 
 const { 
@@ -21,27 +22,109 @@ const anthropic = new Anthropic({
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*'
 }));
+
+// Stripe webhook needs raw body
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    
+    try {
+        const event = stripe.webhooks.constructEvent(
+            req.body,
+            sig,
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+        
+        if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const userId = session.client_reference_id;
+            const priceId = session.line_items?.data[0]?.price?.id;
+            
+            // Determine plan based on price ID
+            let plan = 'free';
+            if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
+                plan = 'starter';
+            } else if (priceId === process.env.STRIPE_PRO_PRICE_ID) {
+                plan = 'pro';
+            } else if (priceId === process.env.STRIPE_UNLIMITED_PRICE_ID) {
+                plan = 'unlimited';
+            }
+            
+            // Store this in your database
+            // For now, just log it
+            console.log(`User ${userId} upgraded to ${plan} plan`);
+            
+            // TODO: Update database with user's plan
+        }
+        
+        res.json({ received: true });
+    } catch (err) {
+        console.error('Webhook error:', err);
+        res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+});
+
 app.use(express.json());
 
-// Simple in-memory rate limiting (replace with Redis in production)
+// Simple in-memory usage tracking (replace with database in production)
 const userUsage = new Map();
 
-function checkRateLimit(userId) {
+// Plan limits
+const PLAN_LIMITS = {
+    free: { daily: 3, monthly: null },
+    starter: { daily: null, monthly: 100 },
+    pro: { daily: null, monthly: 300 },
+    unlimited: { daily: null, monthly: null }
+};
+
+function checkRateLimit(userId, userPlan = 'free') {
     const now = Date.now();
-    const userRecord = userUsage.get(userId) || { count: 0, resetTime: now + 3600000 }; // 1 hour
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
     
-    if (now > userRecord.resetTime) {
-        userRecord.count = 0;
-        userRecord.resetTime = now + 3600000;
+    const userRecord = userUsage.get(userId) || { 
+        dailyCount: 0, 
+        monthlyCount: 0,
+        dailyResetTime: now + oneDayMs,
+        monthlyResetTime: now + oneMonthMs,
+        plan: userPlan
+    };
+    
+    // Reset daily counter if needed
+    if (now > userRecord.dailyResetTime) {
+        userRecord.dailyCount = 0;
+        userRecord.dailyResetTime = now + oneDayMs;
     }
     
-    if (userRecord.count >= 3) {
-        return false;
+    // Reset monthly counter if needed
+    if (now > userRecord.monthlyResetTime) {
+        userRecord.monthlyCount = 0;
+        userRecord.monthlyResetTime = now + oneMonthMs;
     }
     
-    userRecord.count++;
+    const limits = PLAN_LIMITS[userPlan];
+    
+    // Check limits based on plan
+    if (limits.daily !== null && userRecord.dailyCount >= limits.daily) {
+        return { allowed: false, reason: 'daily_limit' };
+    }
+    
+    if (limits.monthly !== null && userRecord.monthlyCount >= limits.monthly) {
+        return { allowed: false, reason: 'monthly_limit' };
+    }
+    
+    // Increment counters
+    userRecord.dailyCount++;
+    userRecord.monthlyCount++;
+    userRecord.plan = userPlan;
     userUsage.set(userId, userRecord);
-    return true;
+    
+    return { 
+        allowed: true, 
+        remaining: {
+            daily: limits.daily ? limits.daily - userRecord.dailyCount : null,
+            monthly: limits.monthly ? limits.monthly - userRecord.monthlyCount : null
+        }
+    };
 }
 
 // Helper function to call Claude
@@ -73,20 +156,47 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Get user usage stats
+app.post('/api/usage', (req, res) => {
+    const { userId, userPlan = 'free' } = req.body;
+    const userRecord = userUsage.get(userId);
+    const limits = PLAN_LIMITS[userPlan];
+    
+    if (!userRecord) {
+        return res.json({
+            plan: userPlan,
+            dailyUsed: 0,
+            monthlyUsed: 0,
+            dailyLimit: limits.daily,
+            monthlyLimit: limits.monthly
+        });
+    }
+    
+    res.json({
+        plan: userPlan,
+        dailyUsed: userRecord.dailyCount,
+        monthlyUsed: userRecord.monthlyCount,
+        dailyLimit: limits.daily,
+        monthlyLimit: limits.monthly
+    });
+});
+
 // Optimize Post
 app.post('/api/optimize', async (req, res) => {
     try {
-        const { post, options, userId } = req.body;
+        const { post, options, userId, userPlan = 'free' } = req.body;
         
         if (!post || !post.trim()) {
             return res.status(400).json({ error: 'Post content is required' });
         }
         
         // Check rate limit
-        if (!checkRateLimit(userId)) {
-            return res.status(429).json({ 
-                error: 'Rate limit exceeded. Upgrade to Pro for unlimited use.' 
-            });
+        const limitCheck = checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
         }
         
         // Build user message with options
@@ -102,7 +212,8 @@ app.post('/api/optimize', async (req, res) => {
         
         res.json({ 
             optimizedPost: optimizedPost.trim(),
-            success: true 
+            success: true,
+            remaining: limitCheck.remaining
         });
         
     } catch (error) {
@@ -114,16 +225,18 @@ app.post('/api/optimize', async (req, res) => {
 // Generate Thread
 app.post('/api/generate-thread', async (req, res) => {
     try {
-        const { topic, options, userId } = req.body;
+        const { topic, options, userId, userPlan = 'free' } = req.body;
         
         if (!topic || !topic.trim()) {
             return res.status(400).json({ error: 'Thread topic is required' });
         }
         
-        if (!checkRateLimit(userId)) {
-            return res.status(429).json({ 
-                error: 'Rate limit exceeded. Upgrade to Pro for unlimited use.' 
-            });
+        const limitCheck = checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
         }
         
         let userMessage = `Create a viral thread about:\n\n"${topic}"\n\n`;
@@ -137,7 +250,8 @@ app.post('/api/generate-thread', async (req, res) => {
         
         res.json({ 
             thread: thread.trim(),
-            success: true 
+            success: true,
+            remaining: limitCheck.remaining
         });
         
     } catch (error) {
@@ -149,16 +263,18 @@ app.post('/api/generate-thread', async (req, res) => {
 // Generate Reply
 app.post('/api/generate-reply', async (req, res) => {
     try {
-        const { originalPost, replyAngle, options, userId } = req.body;
+        const { originalPost, replyAngle, options, userId, userPlan = 'free' } = req.body;
         
         if (!originalPost || !originalPost.trim()) {
             return res.status(400).json({ error: 'Original post is required' });
         }
         
-        if (!checkRateLimit(userId)) {
-            return res.status(429).json({ 
-                error: 'Rate limit exceeded. Upgrade to Pro for unlimited use.' 
-            });
+        const limitCheck = checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
         }
         
         let userMessage = `Generate an engaging reply to this post:\n\n"${originalPost}"\n\n`;
@@ -176,7 +292,8 @@ app.post('/api/generate-reply', async (req, res) => {
         
         res.json({ 
             reply: reply.trim(),
-            success: true 
+            success: true,
+            remaining: limitCheck.remaining
         });
         
     } catch (error) {
@@ -185,9 +302,52 @@ app.post('/api/generate-reply', async (req, res) => {
     }
 });
 
+// Create Stripe Checkout Session
+app.post('/api/create-checkout', async (req, res) => {
+    try {
+        const { userId, plan } = req.body;
+        
+        // Determine which price ID to use
+        let priceId;
+        if (plan === 'starter') {
+            priceId = process.env.STRIPE_STARTER_PRICE_ID;
+        } else if (plan === 'pro') {
+            priceId = process.env.STRIPE_PRO_PRICE_ID;
+        } else if (plan === 'unlimited') {
+            priceId = process.env.STRIPE_UNLIMITED_PRICE_ID;
+        } else {
+            return res.status(400).json({ error: 'Invalid plan' });
+        }
+        
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [
+                {
+                    price: priceId,
+                    quantity: 1,
+                },
+            ],
+            mode: 'subscription',
+            success_url: `${process.env.FRONTEND_URL}?success=true&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.FRONTEND_URL}?canceled=true`,
+            client_reference_id: userId,
+            metadata: {
+                userId: userId,
+                plan: plan
+            }
+        });
+        
+        res.json({ url: session.url });
+    } catch (error) {
+        console.error('Stripe error:', error);
+        res.status(500).json({ error: 'Failed to create checkout session' });
+    }
+});
+
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`📡 API available at http://localhost:${PORT}/api`);
     console.log(`🤖 Claude API configured: ${!!process.env.CLAUDE_API_KEY}`);
+    console.log(`💳 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
 });
