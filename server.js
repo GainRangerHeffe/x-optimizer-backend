@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const mysql = require('mysql2/promise');
 const Anthropic = require('@anthropic-ai/sdk');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 require('dotenv').config();
@@ -12,6 +13,49 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// MySQL Connection Pool
+const pool = mysql.createPool({
+    host: 'localhost',
+    port: 3306,
+    user: 'u440148778_bloksi',
+    password: 'A127456@a',
+    database: 'u440148778_bloksi',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// Initialize database table
+async function initDatabase() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(255) UNIQUE NOT NULL,
+                user_email VARCHAR(255),
+                user_name VARCHAR(255),
+                plan VARCHAR(50) DEFAULT 'free',
+                stripe_customer_id VARCHAR(255),
+                stripe_subscription_id VARCHAR(255),
+                subscription_status VARCHAR(50) DEFAULT 'active',
+                daily_count INT DEFAULT 0,
+                monthly_count INT DEFAULT 0,
+                daily_reset_time BIGINT,
+                monthly_reset_time BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_stripe_customer (stripe_customer_id)
+            )
+        `);
+        console.log('✅ Database table ready');
+    } catch (error) {
+        console.error('❌ Database init error:', error);
+    }
+}
+
+initDatabase();
 
 // Initialize Claude
 const anthropic = new Anthropic({
@@ -37,17 +81,32 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         if (event.type === 'checkout.session.completed') {
             const session = event.data.object;
             const userId = session.client_reference_id;
-            const priceId = session.amount_total;
+            const plan = session.metadata.plan;
             
-            let plan = 'free';
-            // Determine plan based on amount
-            if (priceId === 499) plan = 'starter';
-            else if (priceId === 999) plan = 'pro';
-            else if (priceId === 1999) plan = 'unlimited';
-            else if (priceId === 19900) plan = 'yearly';
+            // Update database
+            await pool.query(`
+                INSERT INTO subscriptions (user_id, plan, stripe_customer_id, stripe_subscription_id, monthly_count, daily_count)
+                VALUES (?, ?, ?, ?, 0, 0)
+                ON DUPLICATE KEY UPDATE 
+                    plan = ?,
+                    stripe_customer_id = ?,
+                    stripe_subscription_id = ?,
+                    subscription_status = 'active',
+                    monthly_count = 0,
+                    daily_count = 0
+            `, [userId, plan, session.customer, session.subscription, plan, session.customer, session.subscription]);
             
-            console.log(`User ${userId} upgraded to ${plan} plan`);
-            // TODO: Update database with user's plan
+            console.log(`✅ User ${userId} upgraded to ${plan}`);
+        }
+        
+        if (event.type === 'customer.subscription.deleted') {
+            const subscription = event.data.object;
+            await pool.query(`
+                UPDATE subscriptions 
+                SET subscription_status = 'canceled', plan = 'free'
+                WHERE stripe_subscription_id = ?
+            `, [subscription.id]);
+            console.log(`❌ Subscription canceled: ${subscription.id}`);
         }
         
         res.json({ received: true });
@@ -59,10 +118,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 
 app.use(express.json());
 
-// Simple in-memory usage tracking (replace with database in production)
-const userUsage = new Map();
-
-// Plan limits - UPDATED WITH YOUR NEW TIERS
+// Plan limits
 const PLAN_LIMITS = {
     free: { daily: 3, monthly: null },
     starter: { daily: null, monthly: 300 },
@@ -71,53 +127,81 @@ const PLAN_LIMITS = {
     yearly: { daily: null, monthly: null }
 };
 
-function checkRateLimit(userId, userPlan = 'free') {
+async function checkRateLimit(userId, userPlan = 'free') {
     const now = Date.now();
-    const oneDayMs = 12 * 60 * 60 * 1000; // 12 hours for free users
+    const oneDayMs = 12 * 60 * 60 * 1000;
     const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
     
-    const userRecord = userUsage.get(userId) || { 
-        dailyCount: 0, 
-        monthlyCount: 0,
-        dailyResetTime: now + oneDayMs,
-        monthlyResetTime: now + oneMonthMs,
-        plan: userPlan
-    };
+    // Get or create user record
+    const [rows] = await pool.query(
+        'SELECT * FROM subscriptions WHERE user_id = ?',
+        [userId]
+    );
     
-    // Reset daily counter if needed (only for free users)
-    if (now > userRecord.dailyResetTime) {
-        userRecord.dailyCount = 0;
-        userRecord.dailyResetTime = now + oneDayMs;
+    let userRecord;
+    if (rows.length === 0) {
+        // Create new record
+        await pool.query(`
+            INSERT INTO subscriptions (user_id, plan, daily_count, monthly_count, daily_reset_time, monthly_reset_time)
+            VALUES (?, ?, 0, 0, ?, ?)
+        `, [userId, userPlan, now + oneDayMs, now + oneMonthMs]);
+        
+        userRecord = {
+            daily_count: 0,
+            monthly_count: 0,
+            daily_reset_time: now + oneDayMs,
+            monthly_reset_time: now + oneMonthMs,
+            plan: userPlan
+        };
+    } else {
+        userRecord = rows[0];
     }
     
-    // Reset monthly counter if needed
-    if (now > userRecord.monthlyResetTime) {
-        userRecord.monthlyCount = 0;
-        userRecord.monthlyResetTime = now + oneMonthMs;
+    // Reset counters if needed
+    let needsUpdate = false;
+    if (now > userRecord.daily_reset_time) {
+        userRecord.daily_count = 0;
+        userRecord.daily_reset_time = now + oneDayMs;
+        needsUpdate = true;
+    }
+    
+    if (now > userRecord.monthly_reset_time) {
+        userRecord.monthly_count = 0;
+        userRecord.monthly_reset_time = now + oneMonthMs;
+        needsUpdate = true;
+    }
+    
+    if (needsUpdate) {
+        await pool.query(`
+            UPDATE subscriptions 
+            SET daily_count = ?, monthly_count = ?, daily_reset_time = ?, monthly_reset_time = ?
+            WHERE user_id = ?
+        `, [userRecord.daily_count, userRecord.monthly_count, userRecord.daily_reset_time, userRecord.monthly_reset_time, userId]);
     }
     
     const limits = PLAN_LIMITS[userPlan];
     
-    // Check limits based on plan
-    if (limits.daily !== null && userRecord.dailyCount >= limits.daily) {
+    // Check limits
+    if (limits.daily !== null && userRecord.daily_count >= limits.daily) {
         return { allowed: false, reason: 'daily_limit' };
     }
     
-    if (limits.monthly !== null && userRecord.monthlyCount >= limits.monthly) {
+    if (limits.monthly !== null && userRecord.monthly_count >= limits.monthly) {
         return { allowed: false, reason: 'monthly_limit' };
     }
     
     // Increment counters
-    userRecord.dailyCount++;
-    userRecord.monthlyCount++;
-    userRecord.plan = userPlan;
-    userUsage.set(userId, userRecord);
+    await pool.query(`
+        UPDATE subscriptions 
+        SET daily_count = daily_count + 1, monthly_count = monthly_count + 1
+        WHERE user_id = ?
+    `, [userId]);
     
     return { 
         allowed: true, 
         remaining: {
-            daily: limits.daily ? limits.daily - userRecord.dailyCount : null,
-            monthly: limits.monthly ? limits.monthly - userRecord.monthlyCount : null
+            daily: limits.daily ? limits.daily - userRecord.daily_count - 1 : null,
+            monthly: limits.monthly ? limits.monthly - userRecord.monthly_count - 1 : null
         }
     };
 }
@@ -129,14 +213,8 @@ async function callClaude(systemPrompt, userMessage) {
             model: "claude-sonnet-4-20250514",
             max_tokens: 1024,
             system: systemPrompt,
-            messages: [
-                {
-                    role: "user",
-                    content: userMessage
-                }
-            ]
+            messages: [{ role: "user", content: userMessage }]
         });
-        
         return message.content[0].text;
     } catch (error) {
         console.error('Claude API Error:', error);
@@ -144,36 +222,46 @@ async function callClaude(systemPrompt, userMessage) {
     }
 }
 
-// API Routes
-
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Get user usage stats - THIS WAS MISSING!
-app.post('/api/usage', (req, res) => {
-    const { userId, userPlan = 'free' } = req.body;
-    const userRecord = userUsage.get(userId);
-    const limits = PLAN_LIMITS[userPlan];
-    
-    if (!userRecord) {
-        return res.json({
-            plan: userPlan,
-            dailyUsed: 0,
-            monthlyUsed: 0,
+// Get user usage stats - RETURNS CURRENT PLAN FROM DATABASE
+app.post('/api/usage', async (req, res) => {
+    try {
+        const { userId, userPlan = 'free' } = req.body;
+        
+        const [rows] = await pool.query(
+            'SELECT * FROM subscriptions WHERE user_id = ?',
+            [userId]
+        );
+        
+        if (rows.length === 0) {
+            const limits = PLAN_LIMITS[userPlan];
+            return res.json({
+                plan: userPlan,
+                dailyUsed: 0,
+                monthlyUsed: 0,
+                dailyLimit: limits.daily,
+                monthlyLimit: limits.monthly
+            });
+        }
+        
+        const userRecord = rows[0];
+        const limits = PLAN_LIMITS[userRecord.plan];
+        
+        res.json({
+            plan: userRecord.plan, // This will be the ACTUAL plan from database
+            dailyUsed: userRecord.daily_count,
+            monthlyUsed: userRecord.monthly_count,
             dailyLimit: limits.daily,
             monthlyLimit: limits.monthly
         });
+    } catch (error) {
+        console.error('Usage stats error:', error);
+        res.status(500).json({ error: 'Failed to fetch usage stats' });
     }
-    
-    res.json({
-        plan: userPlan,
-        dailyUsed: userRecord.dailyCount,
-        monthlyUsed: userRecord.monthlyCount,
-        dailyLimit: limits.daily,
-        monthlyLimit: limits.monthly
-    });
 });
 
 // Optimize Post
@@ -185,7 +273,7 @@ app.post('/api/optimize', async (req, res) => {
             return res.status(400).json({ error: 'Post content is required' });
         }
         
-        const limitCheck = checkRateLimit(userId, userPlan);
+        const limitCheck = await checkRateLimit(userId, userPlan);
         if (!limitCheck.allowed) {
             const message = limitCheck.reason === 'daily_limit' 
                 ? 'Daily limit reached. Upgrade to get more uses!' 
@@ -228,7 +316,7 @@ app.post('/api/generate-thread', async (req, res) => {
             return res.status(400).json({ error: 'Thread topic is required' });
         }
         
-        const limitCheck = checkRateLimit(userId, userPlan);
+        const limitCheck = await checkRateLimit(userId, userPlan);
         if (!limitCheck.allowed) {
             const message = limitCheck.reason === 'daily_limit' 
                 ? 'Daily limit reached. Upgrade to get more uses!' 
@@ -257,7 +345,7 @@ app.post('/api/generate-thread', async (req, res) => {
     }
 });
 
-// Generate Reply - WITH UPDATED LENGTH HANDLING
+// Generate Reply
 app.post('/api/generate-reply', async (req, res) => {
     try {
         const { originalPost, replyAngle, options, userId, userPlan = 'free' } = req.body;
@@ -266,7 +354,7 @@ app.post('/api/generate-reply', async (req, res) => {
             return res.status(400).json({ error: 'Original post is required' });
         }
         
-        const limitCheck = checkRateLimit(userId, userPlan);
+        const limitCheck = await checkRateLimit(userId, userPlan);
         if (!limitCheck.allowed) {
             const message = limitCheck.reason === 'daily_limit' 
                 ? 'Daily limit reached. Upgrade to get more uses!' 
@@ -276,7 +364,6 @@ app.post('/api/generate-reply', async (req, res) => {
         
         let userMessage = `Generate an engaging reply to this post:\n\n"${originalPost}"\n\n`;
         
-        // CRITICAL: If user provided angle, make it strict
         if (replyAngle && replyAngle.trim()) {
             userMessage += `CRITICAL INSTRUCTIONS FROM USER: "${replyAngle}"\n`;
             userMessage += `You MUST follow these instructions EXACTLY. If they say "1-2 lines", give MAXIMUM 2 sentences (120-180 characters). If they say "short", give 1-3 sentences max.\n\n`;
@@ -301,45 +388,26 @@ app.post('/api/generate-reply', async (req, res) => {
     }
 });
 
-// Create Stripe Checkout Session - THIS WAS MISSING!
+// Create Stripe Checkout Session
 app.post('/api/create-checkout', async (req, res) => {
     try {
         const { userId, plan } = req.body;
         
-        // Determine which price ID to use
-        let priceId, amount;
-        if (plan === 'starter') {
-            priceId = process.env.STRIPE_STARTER_PRICE_ID;
-            amount = 499;
-        } else if (plan === 'pro') {
-            priceId = process.env.STRIPE_PRO_PRICE_ID;
-            amount = 999;
-        } else if (plan === 'unlimited') {
-            priceId = process.env.STRIPE_UNLIMITED_PRICE_ID;
-            amount = 1999;
-        } else if (plan === 'yearly') {
-            priceId = process.env.STRIPE_YEARLY_PRICE_ID;
-            amount = 19900;
-        } else {
-            return res.status(400).json({ error: 'Invalid plan' });
-        }
+        let priceId;
+        if (plan === 'starter') priceId = process.env.STRIPE_STARTER_PRICE_ID;
+        else if (plan === 'pro') priceId = process.env.STRIPE_PRO_PRICE_ID;
+        else if (plan === 'unlimited') priceId = process.env.STRIPE_UNLIMITED_PRICE_ID;
+        else if (plan === 'yearly') priceId = process.env.STRIPE_YEARLY_PRICE_ID;
+        else return res.status(400).json({ error: 'Invalid plan' });
         
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            line_items: [
-                {
-                    price: priceId,
-                    quantity: 1,
-                },
-            ],
+            line_items: [{ price: priceId, quantity: 1 }],
             mode: 'subscription',
             success_url: `${process.env.FRONTEND_URL}?success=true&plan=${plan}`,
             cancel_url: `${process.env.FRONTEND_URL}?canceled=true`,
             client_reference_id: userId,
-            metadata: {
-                userId: userId,
-                plan: plan
-            }
+            metadata: { userId, plan }
         });
         
         res.json({ url: session.url });
@@ -395,8 +463,14 @@ app.post('/api/nowpayments-webhook', express.json(), async (req, res) => {
         if (payment.payment_status === 'finished') {
             const orderId = payment.order_id;
             const [userId, plan] = orderId.split('_');
-            console.log(`Crypto payment successful for user ${userId}, plan: ${plan}`);
-            // TODO: Update database
+            
+            await pool.query(`
+                INSERT INTO subscriptions (user_id, plan, monthly_count, daily_count)
+                VALUES (?, ?, 0, 0)
+                ON DUPLICATE KEY UPDATE plan = ?, monthly_count = 0, daily_count = 0
+            `, [userId, plan, plan]);
+            
+            console.log(`✅ Crypto payment successful for ${userId}, plan: ${plan}`);
         }
         
         res.status(200).send('OK');
@@ -413,41 +487,5 @@ app.listen(PORT, () => {
     console.log(`🤖 Claude API configured: ${!!process.env.CLAUDE_API_KEY}`);
     console.log(`💳 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
     console.log(`💎 NOWPayments configured: ${!!process.env.NOWPAYMENTS_API_KEY}`);
+    console.log(`🗄️  MySQL connected`);
 });
-
-// Handle Mid-Month Upgrade
-app.post('/api/upgrade-plan', async (req, res) => {
-    try {
-        const { userId, currentPlan, newPlan } = req.body;
-        
-        // Validate upgrade path
-        const validUpgrades = {
-            'free': ['starter', 'pro', 'unlimited', 'yearly'],
-            'starter': ['pro', 'unlimited', 'yearly'],
-            'pro': ['unlimited', 'yearly']
-        };
-        
-        if (!validUpgrades[currentPlan]?.includes(newPlan)) {
-            return res.status(400).json({ error: 'Invalid upgrade path' });
-        }
-        
-        // Reset usage limits immediately for new plan
-        const userRecord = userUsage.get(userId);
-        if (userRecord) {
-            userRecord.monthlyCount = 0; // Reset count for new tier
-            userRecord.plan = newPlan;
-            userUsage.set(userId, userRecord);
-        }
-        
-        res.json({ 
-            success: true, 
-            message: 'Plan upgraded successfully',
-            newPlan: newPlan
-        });
-        
-    } catch (error) {
-        console.error('Upgrade error:', error);
-        res.status(500).json({ error: 'Failed to upgrade plan' });
-    }
-});
-
