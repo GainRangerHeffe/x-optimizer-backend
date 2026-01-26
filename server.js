@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 
 // MySQL Connection Pool
 const pool = mysql.createPool({
-    host: 'localhost',
+    host: 'srv1957.hstgr.io',
     port: 3306,
     user: 'u440148778_bloksi',
     password: 'A127456@a',
