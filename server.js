@@ -16,11 +16,11 @@ const PORT = process.env.PORT || 3000;
 
 // MySQL Connection Pool
 const pool = mysql.createPool({
-    host: 'srv1957.hstgr.io',
-    port: 3306,
-    user: 'u440148778_bloksi',
-    password: 'A127456@a',
-    database: 'u440148778_bloksi',
+    host: process.env.MYSQL_HOST || 'srv1957.hstgr.io',
+    port: process.env.MYSQL_PORT || 3306,
+    user: process.env.MYSQL_USER || 'u440148778_bloksi',
+    password: process.env.MYSQL_PASSWORD,
+    database: process.env.MYSQL_DATABASE || 'u440148778_bloksi',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
