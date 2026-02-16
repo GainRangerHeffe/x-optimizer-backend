@@ -5,6 +5,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 require('dotenv').config();
 
+const igPrompts = require('./ig-prompts');
+
 const { 
     postOptimizerPrompt, 
     threadGeneratorPrompt, 
@@ -480,6 +482,127 @@ app.post('/api/nowpayments-webhook', express.json(), async (req, res) => {
     }
 });
 
+// IG Caption Optimizer
+app.post('/api/optimize-ig', async (req, res) => {
+    try {
+        const { caption, options, userId, userPlan = 'free' } = req.body;
+        
+        if (!caption || !caption.trim()) {
+            return res.status(400).json({ error: 'Caption content is required' });
+        }
+        
+        const limitCheck = await checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
+        }
+        
+        let userMessage = `Optimize this Instagram caption:\n\n"${caption}"\n\n`;
+        
+        if (options.captionGoal && options.captionGoal.trim()) {
+            userMessage += `Content goal: ${options.captionGoal}\n\n`;
+        }
+        
+        if (options.addHook) userMessage += '- Strong hook in first line\n';
+        if (options.addHashtags) userMessage += '- Include strategic hashtags (mix of sizes)\n';
+        if (options.addCTA) userMessage += '- Clear call-to-action\n';
+        
+        userMessage += '\nReturn ONLY the optimized caption, nothing else.';
+        
+        const optimizedCaption = await callClaude(igPrompts.captionOptimizerPrompt, userMessage);
+        
+        res.json({ 
+            optimizedCaption: optimizedCaption.trim(),
+            success: true,
+            remaining: limitCheck.remaining
+        });
+        
+    } catch (error) {
+        console.error('IG caption error:', error);
+        res.status(500).json({ error: 'Failed to optimize caption' });
+    }
+});
+
+// IG Carousel Generator
+app.post('/api/generate-carousel', async (req, res) => {
+    try {
+        const { topic, options, userId, userPlan = 'free' } = req.body;
+        
+        if (!topic || !topic.trim()) {
+            return res.status(400).json({ error: 'Carousel topic is required' });
+        }
+        
+        const limitCheck = await checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
+        }
+        
+        let userMessage = `Create an Instagram carousel about:\n\n"${topic}"\n\n`;
+        userMessage += `Number of slides: ${options.slideCount}\n\n`;
+        
+        if (options.addTitles) userMessage += '- Include clear titles for each slide\n';
+        if (options.makeEducational) userMessage += '- Make it educational and valuable\n';
+        
+        userMessage += '\nFormat as SLIDE 1:, SLIDE 2:, etc.';
+        
+        const carousel = await callClaude(igPrompts.carouselGeneratorPrompt, userMessage);
+        
+        res.json({ 
+            carousel: carousel.trim(),
+            success: true,
+            remaining: limitCheck.remaining
+        });
+        
+    } catch (error) {
+        console.error('Carousel error:', error);
+        res.status(500).json({ error: 'Failed to generate carousel' });
+    }
+});
+
+// IG Reel Script
+app.post('/api/generate-reel', async (req, res) => {
+    try {
+        const { concept, options, userId, userPlan = 'free' } = req.body;
+        
+        if (!concept || !concept.trim()) {
+            return res.status(400).json({ error: 'Reel concept is required' });
+        }
+        
+        const limitCheck = await checkRateLimit(userId, userPlan);
+        if (!limitCheck.allowed) {
+            const message = limitCheck.reason === 'daily_limit' 
+                ? 'Daily limit reached. Upgrade to get more uses!' 
+                : 'Monthly limit reached. Upgrade for more uses!';
+            return res.status(429).json({ error: message });
+        }
+        
+        let userMessage = `Create an Instagram Reel script about:\n\n"${concept}"\n\n`;
+        userMessage += `Length: ${options.reelLength} seconds\n\n`;
+        
+        if (options.includeHook) userMessage += '- Strong 3-second hook\n';
+        if (options.includeText) userMessage += '- On-screen text suggestions\n';
+        
+        userMessage += '\nFormat with HOOK:, CONTENT:, CTA:, ON-SCREEN TEXT: sections.';
+        
+        const reel = await callClaude(igPrompts.reelScriptPrompt, userMessage);
+        
+        res.json({ 
+            reel: reel.trim(),
+            success: true,
+            remaining: limitCheck.remaining
+        });
+        
+    } catch (error) {
+        console.error('Reel error:', error);
+        res.status(500).json({ error: 'Failed to generate reel script' });
+    }
+});
+
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
@@ -489,3 +612,4 @@ app.listen(PORT, () => {
     console.log(`💎 NOWPayments configured: ${!!process.env.NOWPAYMENTS_API_KEY}`);
     console.log(`🗄️  MySQL connected`);
 });
+
