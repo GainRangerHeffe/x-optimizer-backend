@@ -66,7 +66,10 @@ const anthropic = new Anthropic({
 
 // Middleware
 app.use(cors({
-    origin: process.env.FRONTEND_URL || '*'
+    origin: ['https://bloksi.xyz', 'http://localhost:3000', 'http://localhost:5173'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Stripe webhook needs raw body
@@ -612,4 +615,5 @@ app.listen(PORT, () => {
     console.log(`💎 NOWPayments configured: ${!!process.env.NOWPAYMENTS_API_KEY}`);
     console.log(`🗄️  MySQL connected`);
 });
+
 
